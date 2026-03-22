@@ -1,0 +1,728 @@
+/*
+ * Generador de Reporte Tecnico PDF — C++ con paginacion automatica
+ * Dependencias: Cairo (PDF) + FreeType
+ *
+ *  g++ -std=c++17 main.cpp -o gen_report \
+ *      $(pkg-config --cflags --libs cairo freetype2 fontconfig)
+ */
+
+#include <cairo/cairo.h>
+#include <cairo/cairo-pdf.h>
+#include <cairo/cairo-ft.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+#include <string>
+#include <vector>
+#include <sstream>
+#include <cmath>
+#include <cstdio>
+
+// Page geometry (letter 8.5x11 in @ 72pt/in)
+static constexpr double PW   = 612.0;
+static constexpr double PH   = 792.0;
+static constexpr double ML   = 52.0;
+static constexpr double MR   = 52.0;
+static constexpr double MT   = 50.0;
+static constexpr double MB   = 42.0;
+static constexpr double CW   = PW - ML - MR;
+static constexpr double YMAX = PH - MB;
+
+struct RGB { double r, g, b; };
+static const RGB NAVY   {0.106,0.165,0.290};
+static const RGB BLUE   {0.180,0.373,0.639};
+static const RGB LBLUE  {0.839,0.894,0.969};
+static const RGB ACCENT {0.910,0.443,0.102};
+static const RGB LGRAY  {0.955,0.963,0.974};
+static const RGB DGRAY  {0.333,0.333,0.333};
+static const RGB WHITE  {1.000,1.000,1.000};
+static const RGB TERM   {0.051,0.067,0.090};
+static const RGB GREEN  {0.000,0.880,0.400};
+static const RGB MIDBLUE{0.600,0.750,0.900};
+
+// Font globals
+static FT_Library  ftLib;
+static FT_Face     ftSans, ftBold, ftMono, ftMonoBold;
+static cairo_font_face_t *cfSans, *cfBold, *cfMono, *cfMonoBold;
+
+static void initFonts() {
+    FT_Init_FreeType(&ftLib);
+    FT_New_Face(ftLib,"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",         0,&ftSans);
+    FT_New_Face(ftLib,"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",    0,&ftBold);
+    FT_New_Face(ftLib,"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",     0,&ftMono);
+    FT_New_Face(ftLib,"/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",0,&ftMonoBold);
+    cfSans     = cairo_ft_font_face_create_for_ft_face(ftSans,    0);
+    cfBold     = cairo_ft_font_face_create_for_ft_face(ftBold,    0);
+    cfMono     = cairo_ft_font_face_create_for_ft_face(ftMono,    0);
+    cfMonoBold = cairo_ft_font_face_create_for_ft_face(ftMonoBold,0);
+}
+
+static void doneFonts() {
+    cairo_font_face_destroy(cfSans);  cairo_font_face_destroy(cfBold);
+    cairo_font_face_destroy(cfMono);  cairo_font_face_destroy(cfMonoBold);
+    FT_Done_Face(ftSans); FT_Done_Face(ftBold);
+    FT_Done_Face(ftMono); FT_Done_Face(ftMonoBold);
+    FT_Done_FreeType(ftLib);
+}
+
+// ============================================================
+// Doc — drawing context with automatic pagination
+// ============================================================
+struct Doc {
+    cairo_surface_t* surf;
+    cairo_t*         cr;
+    double           y;
+    int              pageNo;
+
+    explicit Doc(const char* path) {
+        surf   = cairo_pdf_surface_create(path, PW, PH);
+        cr     = cairo_create(surf);
+        pageNo = 1;
+        y      = MT;
+        drawChrome();
+    }
+    ~Doc() { cairo_destroy(cr); cairo_surface_destroy(surf); }
+
+    // --- primitives ---
+    void col(const RGB& c)  { cairo_set_source_rgb(cr, c.r, c.g, c.b); }
+    void fnt(cairo_font_face_t* f, double sz) {
+        cairo_set_font_face(cr, f);
+        cairo_set_font_size(cr, sz);
+    }
+    double tw(const std::string& s) {
+        cairo_text_extents_t e;
+        cairo_text_extents(cr, s.c_str(), &e);
+        return e.x_advance;
+    }
+    void txt(double x, double yy, const std::string& s) {
+        cairo_move_to(cr, x, yy);
+        cairo_show_text(cr, s.c_str());
+    }
+    void frect(double x, double yy, double w, double h, const RGB& c, double r=0) {
+        col(c);
+        if (r<=0){ cairo_rectangle(cr,x,yy,w,h); cairo_fill(cr); return; }
+        cairo_new_path(cr);
+        cairo_arc(cr,x+r,  yy+r,  r,M_PI,    3*M_PI/2);
+        cairo_arc(cr,x+w-r,yy+r,  r,3*M_PI/2,2*M_PI);
+        cairo_arc(cr,x+w-r,yy+h-r,r,0,       M_PI/2);
+        cairo_arc(cr,x+r,  yy+h-r,r,M_PI/2,  M_PI);
+        cairo_close_path(cr); cairo_fill(cr);
+    }
+    void srect(double x, double yy, double w, double h, const RGB& c, double lw=0.4) {
+        col(c); cairo_set_line_width(cr,lw);
+        cairo_rectangle(cr,x,yy,w,h); cairo_stroke(cr);
+    }
+    void hline(double x1, double x2, double yy, const RGB& c, double lw=0.6) {
+        col(c); cairo_set_line_width(cr,lw);
+        cairo_move_to(cr,x1,yy); cairo_line_to(cr,x2,yy); cairo_stroke(cr);
+    }
+
+    // word-wrap
+    std::vector<std::string> wrap(const std::string& t, double mw) {
+        std::vector<std::string> out;
+        std::istringstream ss(t);
+        std::string word, line;
+        while (ss >> word) {
+            std::string test = line.empty() ? word : line+" "+word;
+            if (tw(test)<=mw) line=test;
+            else { if(!line.empty()) out.push_back(line); line=word; }
+        }
+        if (!line.empty()) out.push_back(line);
+        if (out.empty()) out.push_back("");
+        return out;
+    }
+
+    // page chrome: header + footer lines
+    void drawChrome() {
+        frect(0, PH-36, PW, 36, NAVY);
+        fnt(cfBold,9.5); col(WHITE);
+        txt(ML, PH-12, "Sistema de Gestion de Rutas y Paquetes");
+        fnt(cfSans,8.5); col(LBLUE);
+        std::string pn = "Pag. "+std::to_string(pageNo);
+        txt(PW-MR-tw(pn), PH-12, pn);
+        hline(ML, ML+CW, PH-38, LBLUE, 0.5);
+        hline(ML, ML+CW, MT-8,  LBLUE, 0.5);
+    }
+
+    void newPage() {
+        cairo_show_page(cr);
+        pageNo++;
+        y = MT;
+        drawChrome();
+    }
+
+    // ensure h pixels fit; break page if needed
+    void need(double h) { if (y+h > YMAX) newPage(); }
+
+    void gap(double h=6) { y+=h; }
+
+    // ---- content helpers ----
+
+    void sectionBanner(const std::string& title, const RGB& bg=BLUE) {
+        double bh=24.0;
+        need(bh+10);
+        frect(ML,y,CW,bh,bg,4);
+        fnt(cfBold,12.5); col(WHITE);
+        txt(ML+10,y+bh-7,title);
+        y+=bh+8;
+    }
+
+    void subHead(const std::string& t, const RGB& c=NAVY) {
+        need(20);
+        frect(ML,y,3.5,14,c,1.5);
+        fnt(cfBold,10.5); col(c);
+        txt(ML+10,y+12,t);
+        y+=18;
+    }
+
+    // multi-line paragraph with automatic page breaks
+    void para(const std::string& text,
+              cairo_font_face_t* f=nullptr,
+              double sz=9.5, const RGB& c=DGRAY, double indent=0) {
+        if(!f) f=cfSans;
+        fnt(f,sz);
+        double lh=sz*1.45;
+        for (auto& ln : wrap(text, CW-indent)) {
+            need(lh);
+            col(c);
+            txt(ML+indent, y+sz, ln);
+            y+=lh;
+        }
+        y+=2;
+    }
+
+    void hr2() {
+        need(12); hline(ML,ML+CW,y+4,LBLUE,0.5); y+=12;
+    }
+
+    // code block — splits across pages line by line
+    void code(const std::vector<std::string>& lines, double sz=8.2) {
+        double lh=sz*1.38;
+        double pad=5.0;
+        // draw line by line, starting new page if needed
+        // first check if we need a header bg
+        // We draw per-line with alternating bg
+        for (size_t i=0; i<lines.size(); i++) {
+            need(lh+1);
+            bool first = (i==0);
+            bool last  = (i==lines.size()-1);
+            double rh  = lh + (first?pad:0) + (last?pad:0);
+            if (first) {
+                // top rounded corners bg — just flat here per line
+            }
+            frect(ML,y,CW,lh+(i==0?pad:0)+(i+1==lines.size()?pad:0),LGRAY);
+            srect(ML,y,CW,lh+(first?pad:0)+(last?pad:0),LBLUE,0.4);
+            fnt(cfMono,sz); col({0.06,0.20,0.06});
+            txt(ML+8, y+(first?pad:0)+sz, lines[i]);
+            y += lh+(first?pad:0)+(last?pad:0);
+            (void)rh; (void)first; (void)last;
+        }
+        y+=4;
+    }
+
+    // terminal block — dark theme, splits across pages
+    void term(const std::vector<std::string>& lines,
+              const std::string& label="Terminal", double sz=8.2) {
+        double lh=sz*1.38;
+        double hdrH=16.0;
+
+        // header bar
+        need(hdrH+lh);
+        frect(ML,y,CW,hdrH,{0.11,0.11,0.20});
+        fnt(cfMonoBold,8.5); col(WHITE);
+        txt(ML+8,y+hdrH-4,label);
+        y+=hdrH;
+
+        // lines
+        for (size_t i=0; i<lines.size(); i++) {
+            need(lh);
+            frect(ML,y,CW,lh,TERM);
+            fnt(cfMono,sz); col(GREEN);
+            txt(ML+8,y+sz,lines[i]);
+            y+=lh;
+        }
+        // accent bottom
+        hline(ML,ML+CW,y,ACCENT,1.5);
+        y+=8;
+    }
+
+    struct TRow { std::vector<std::string> cells; bool hdr=false; };
+    void table(const std::vector<TRow>& rows,
+               const std::vector<double>& widths,
+               double rh=17.0, double sz=9.0) {
+        for (size_t ri=0; ri<rows.size(); ri++) {
+            need(rh);
+            double x=ML;
+            for (size_t ci=0; ci<rows[ri].cells.size()&&ci<widths.size(); ci++) {
+                RGB bg = rows[ri].hdr ? BLUE : ((ri%2==0)?WHITE:LGRAY);
+                RGB fg = rows[ri].hdr ? WHITE : DGRAY;
+                frect(x,y,widths[ci],rh,bg);
+                srect(x,y,widths[ci],rh,{0.72,0.82,0.92},0.35);
+                fnt(rows[ri].hdr?cfBold:cfSans,sz); col(fg);
+                cairo_save(cr);
+                cairo_rectangle(cr,x+3,y,widths[ci]-6,rh);
+                cairo_clip(cr);
+                txt(x+6,y+rh-4,rows[ri].cells[ci]);
+                cairo_restore(cr);
+                x+=widths[ci];
+            }
+            y+=rh;
+        }
+        y+=4;
+    }
+
+    void umlClass(const std::string& name,
+                  const std::vector<std::string>& attrs,
+                  const std::vector<std::string>& meths) {
+        double lh=13.0, nh=20.0;
+        double total=nh+lh*(attrs.size()+meths.size())+8;
+        need(total);
+
+        frect(ML,y,CW,nh,BLUE);
+        fnt(cfBold,10.5); col(WHITE);
+        double tw2=tw(name);
+        txt(ML+(CW-tw2)/2,y+nh-5,name);
+        y+=nh;
+
+        for (auto& a:attrs) {
+            need(lh);
+            frect(ML,y,CW,lh,LGRAY);
+            srect(ML,y,CW,lh,LBLUE,0.3);
+            fnt(cfMono,8.0); col(DGRAY);
+            txt(ML+10,y+lh-3,a);
+            y+=lh;
+        }
+        hline(ML,ML+CW,y,MIDBLUE,0.7);
+        for (auto& m:meths) {
+            need(lh);
+            frect(ML,y,CW,lh,WHITE);
+            srect(ML,y,CW,lh,LBLUE,0.3);
+            fnt(cfMono,8.0); col({0.10,0.18,0.40});
+            txt(ML+10,y+lh-3,m);
+            y+=lh;
+        }
+        hline(ML,ML+CW,y,BLUE,1.5);
+        y+=8;
+    }
+};
+
+// ============================================================
+// Cover (no chrome, full background)
+// ============================================================
+static void buildCover(Doc& d) {
+    cairo_t* cr=d.cr;
+    d.frect(0,0,PW,PH,NAVY);
+    d.frect(0,PH-70,PW,70,BLUE);
+    d.frect(0,PH*0.50,PW,4,ACCENT);
+
+    d.fnt(cfBold,11);   d.col(WHITE); d.txt(ML,PH-44,"INSTITUTO TECNOLOGICO");
+    d.fnt(cfSans,9.5);  d.col(LBLUE); d.txt(ML,PH-27,"Departamento de Sistemas y Computacion");
+
+    auto ctxt=[&](const std::string& t, cairo_font_face_t* f,
+                  double sz, const RGB& c, double yy){
+        d.fnt(f,sz); d.col(c);
+        double tw2=d.tw(t);
+        d.txt((PW-tw2)/2,yy,t);
+    };
+    ctxt("Sistema de Gestion de",  cfBold,28,WHITE, PH*0.74);
+    ctxt("Rutas y Paquetes",       cfBold,32,WHITE, PH*0.74+36);
+    ctxt("Empresa de Mensajeria",  cfSans,14,LBLUE, PH*0.74+64);
+
+    d.col(ACCENT); cairo_set_line_width(cr,2.2);
+    cairo_move_to(cr,PW/2-90,PH*0.74+80);
+    cairo_line_to(cr,PW/2+90,PH*0.74+80); cairo_stroke(cr);
+
+    struct M{std::string k,v;};
+    std::vector<M> meta={
+        {"Materia:",     "Estructura de Datos y Algoritmos"},
+        {"Proyecto:",    "Sistema Modular de Mensajeria en C++"},
+        {"Tecnologias:", "C++17  |  CMake  |  POO  |  Cairo PDF"},
+        {"Fecha:",       "Marzo 2026"},
+    };
+    double my=PH*0.74+104;
+    for(auto& m:meta){
+        d.fnt(cfBold,9.5); d.col({0.60,0.78,0.92});
+        double kw=d.tw(m.k);
+        d.txt(PW/2-165,my,m.k);
+        d.fnt(cfSans,9.5); d.col({0.87,0.93,0.98});
+        d.txt(PW/2-165+kw+8,my,m.v);
+        my+=18;
+    }
+}
+
+// ============================================================
+// All content pages — single function, auto-paginated
+// ============================================================
+static void buildContent(Doc& d) {
+
+    // 1. Introduccion
+    d.sectionBanner("1.  Introduccion");
+    d.para("El presente reporte documenta el diseno, implementacion y funcionamiento del "
+           "Sistema de Gestion de Rutas y Paquetes desarrollado para una empresa de mensajeria. "
+           "El sistema fue construido en C++17 aplicando Programacion Orientada a Objetos (POO) "
+           "y estructuras de datos fundamentales, organizado de forma modular y compilado mediante CMake.");
+    d.para("El objetivo principal es automatizar cuatro grandes procesos: el registro de ciudades "
+           "en rutas de reparto (lista enlazada), la administracion de paquetes normales y urgentes "
+           "(cola y pila), la simulacion del desplazamiento del camion (cola circular) y el manejo "
+           "de informacion geografica mediante matrices 1D, 2D y dispersa.");
+
+    // 2. Problema
+    d.gap(6);
+    d.sectionBanner("2.  Planteamiento del Problema", NAVY);
+    d.para("La empresa requiere automatizar los siguientes procesos mediante estructuras de datos especializadas:");
+    d.gap(3);
+    {
+        Doc::TRow hdr; hdr.cells={"Estructura","Necesidad del Sistema"}; hdr.hdr=true;
+        std::vector<Doc::TRow> rows={hdr};
+        std::vector<std::pair<std::string,std::string>> rqs={
+            {"Lista Enlazada", "Registro dinamico de ciudades en la ruta de reparto."},
+            {"Cola (FIFO)",    "Administracion de paquetes pendientes de asignar."},
+            {"Pila (LIFO)",    "Organizacion de paquetes urgentes con atencion inmediata."},
+            {"Cola Circular",  "Simulacion del desplazamiento continuo del camion."},
+            {"Matrices",       "Distancias (1D), tiempos (2D) y rutas prioritarias (dispersa)."},
+        };
+        for(auto& r:rqs){ Doc::TRow row; row.cells={r.first,r.second}; rows.push_back(row); }
+        d.table(rows,{128.0,CW-128.0});
+    }
+
+    // 3. UML
+    d.gap(4);
+    d.sectionBanner("3.  Diseno de Clases — Diagrama UML");
+    d.para("El sistema sigue el principio de composicion: las clases especializadas "
+           "encapsulan las estructuras de datos y son integradas por SistemaMensajeria, "
+           "que orquesta el menu interactivo en consola.");
+    d.gap(4);
+
+    struct CD{std::string name;std::vector<std::string>a,m;};
+    std::vector<CD> cls={
+        {"Ciudad",
+         {"+ nombre    : string","+ siguiente : Ciudad*"},
+         {"+ Ciudad(nombre : string)"}},
+        {"Ruta",
+         {"- cabeza : Ciudad*","- tam    : int"},
+         {"+ agregarCiudad(nombre : string)",
+          "+ eliminarPorNombre(nombre) : bool",
+          "+ eliminarPorPosicion(pos)  : bool",
+          "+ mostrarRuta() const"}},
+        {"Paquete",
+         {"+ id          : int","+ descripcion : string",
+          "+ destino     : string","+ urgente     : bool"},
+         {"+ Paquete(id, desc, dest, urgente)",
+          "+ mostrar() const"}},
+        {"GestorRutas",
+         {"- ruta           : Ruta",
+          "- distancias1D   : vector<double>",
+          "- tiempos2D      : vector<vector<double>>",
+          "- matrizDispersa : map<pair<int,int>,double>"},
+         {"+ agregarCiudad(nombre)",
+          "+ agregarPunto1D(nombre, dist)",
+          "+ setTiempo2D(origen, destino, tiempo)",
+          "+ setRutaPrioritaria(origen, destino, prio)",
+          "+ mostrarDistancias1D()",
+          "+ mostrarTiempos2D()",
+          "+ mostrarMatrizDispersa()"}},
+        {"GestorPaquetes",
+         {"- colaPendientes : queue<Paquete>",
+          "- pilaUrgentes   : stack<Paquete>",
+          "- puntoControl   : vector<string>",
+          "- posActual      : int"},
+         {"+ agregarPendiente(desc, dest)",
+          "+ procesarPendiente()",
+          "+ agregarUrgente(desc, dest)",
+          "+ procesarUrgente()",
+          "+ cargarPuntoControl(nombre)",
+          "+ avanzarCamion()",
+          "+ mostrarPuntosControl() const"}},
+        {"SistemaMensajeria",
+         {"- gestorRutas    : GestorRutas",
+          "- gestorPaquetes : GestorPaquetes"},
+         {"+ iniciar()",
+          "+ menuRutas()",
+          "+ menuPaquetes()",
+          "+ menuSimulacion()",
+          "+ menuMatrices()",
+          "+ mostrarResumenGeneral()"}},
+    };
+    for(auto& c:cls) d.umlClass(c.name,c.a,c.m);
+
+    // 4. Estructuras
+    d.gap(4);
+    d.sectionBanner("4.  Estructuras de Datos — Justificacion");
+    d.gap(4);
+    struct S{std::string t,d;};
+    std::vector<S> ss={
+        {"Lista Enlazada Simple — Clase Ruta",
+         "Permite insercion y eliminacion dinamica de ciudades sin reservar memoria contigua. "
+         "Cada nodo Ciudad contiene el nombre y un puntero al siguiente nodo. Es ideal porque "
+         "las rutas de reparto cambian frecuentemente durante la ejecucion del sistema."},
+        {"Cola FIFO — Paquetes Pendientes",
+         "Los paquetes llegan en orden y deben procesarse en ese mismo orden (primero en entrar, "
+         "primero en salir). Implementada con std::queue<Paquete>. Garantiza equidad en "
+         "la asignacion de paquetes a las rutas disponibles."},
+        {"Pila LIFO — Paquetes Urgentes",
+         "Los paquetes urgentes requieren atencion inmediata: el ultimo en llegar es el primero "
+         "en procesarse. Implementada con std::stack<Paquete>. Modela situaciones donde "
+         "el paquete mas reciente puede ser el mas critico."},
+        {"Cola Circular — Simulacion del Camion",
+         "Modela el recorrido continuo del camion por puntos de control. Al llegar al ultimo "
+         "punto, regresa automaticamente al primero. Implementada con un arreglo fijo, "
+         "indices frente/trasero y aritmetica modular (posActual % countCircular)."},
+        {"Matriz 1D — Distancias Acumuladas",
+         "Un vector<double> indexado en paralelo con un vector<string> de nombres. Almacena "
+         "la distancia acumulada desde el origen hasta cada punto de la ruta. Acceso O(1) por indice."},
+        {"Matriz 2D — Tiempos Estimados",
+         "vector<vector<double>> de NxN donde tiempos2D[i][j] representa el tiempo de viaje "
+         "estimado de ciudad i a ciudad j. Permite consultas bidireccionales en O(1) una vez "
+         "conocidos los indices de las ciudades."},
+        {"Matriz Dispersa — Rutas Prioritarias",
+         "std::map<pair<int,int>,double> que solo almacena los elementos no cero. Ahorra "
+         "O(N^2) espacio cuando la mayoria de pares de ciudades no tienen relacion "
+         "prioritaria, lo cual es el caso tipico en redes de ciudades reales."},
+    };
+    for(auto& s:ss){
+        d.subHead(s.t,BLUE);
+        d.para(s.d,nullptr,9.5,DGRAY,12.0);
+        d.gap(2);
+    }
+
+    // 5. Proyecto + CMake
+    d.gap(4);
+    d.sectionBanner("5.  Estructura del Proyecto y CMake",NAVY);
+    d.gap(4);
+    d.subHead("Organizacion de archivos:",NAVY);
+    d.code({
+        "ProyectoMensajeria/",
+        "  CMakeLists.txt",
+        "  /include",
+        "      Ciudad.h          Ruta.h            Paquete.h",
+        "      GestorRutas.h     GestorPaquetes.h  SistemaMensajeria.h",
+        "  /src",
+        "      Ciudad.cpp        Ruta.cpp          Paquete.cpp",
+        "      GestorRutas.cpp   GestorPaquetes.cpp",
+        "      SistemaMensajeria.cpp   main.cpp",
+    });
+    d.gap(4);
+    d.subHead("CMakeLists.txt:",NAVY);
+    d.code({
+        "cmake_minimum_required(VERSION 3.10)",
+        "project(ProyectoMensajeria VERSION 1.0 LANGUAGES CXX)",
+        "set(CMAKE_CXX_STANDARD 17)",
+        "set(CMAKE_CXX_STANDARD_REQUIRED ON)",
+        "",
+        "include_directories(include)",
+        "",
+        "set(SOURCES",
+        "    src/Ciudad.cpp      src/Ruta.cpp",
+        "    src/Paquete.cpp     src/GestorRutas.cpp",
+        "    src/GestorPaquetes.cpp   src/SistemaMensajeria.cpp",
+        "    src/main.cpp)",
+        "",
+        "add_executable(mensajeria ${SOURCES})",
+        "target_compile_options(mensajeria PRIVATE -Wall -Wextra -Wpedantic)",
+    });
+    d.gap(4);
+    d.subHead("Compilacion y ejecucion:",NAVY);
+    d.term({
+        "# Generar Makefiles con CMake",
+        "mkdir build && cd build",
+        "cmake ..",
+        "",
+        "# Compilar",
+        "cmake --build .",
+        "",
+        "# Ejecutar el sistema",
+        "./mensajeria",
+    },"Shell — CMake build");
+
+    // 6. Codigo
+    d.gap(4);
+    d.sectionBanner("6.  Fragmentos de Codigo Clave");
+    d.gap(4);
+
+    d.subHead("Lista Enlazada — agregarCiudad() [Ruta.cpp]",BLUE);
+    d.code({
+        "void Ruta::agregarCiudad(const std::string& nombre) {",
+        "    Ciudad* nueva = new Ciudad(nombre);",
+        "    if (!cabeza) {",
+        "        cabeza = nueva;",
+        "    } else {",
+        "        Ciudad* actual = cabeza;",
+        "        while (actual->siguiente)",
+        "            actual = actual->siguiente;",
+        "        actual->siguiente = nueva;",
+        "    }",
+        "    tam++;",
+        "}",
+    });
+    d.gap(4);
+    d.subHead("Cola Circular — avanzarCamion() [GestorPaquetes.cpp]",BLUE);
+    d.code({
+        "void GestorPaquetes::avanzarCamion() {",
+        "    if (countCircular == 0) {",
+        "        std::cout << \"Sin puntos de control.\\n\";",
+        "        return;",
+        "    }",
+        "    // Aritmetica modular: vuelve al inicio al llegar al final",
+        "    posActual = (posActual + 1) % countCircular;",
+        "    std::cout << \"Camion en: \"",
+        "              << puntoControl[posActual] << \"\\n\";",
+        "}",
+    });
+    d.gap(4);
+    d.subHead("Matriz Dispersa — setRutaPrioritaria() [GestorRutas.cpp]",BLUE);
+    d.code({
+        "void GestorRutas::setRutaPrioritaria(",
+        "        const std::string& origen,",
+        "        const std::string& destino,",
+        "        double prioridad) {",
+        "    auto it1 = std::find(ciudadesDispersa.begin(),",
+        "                         ciudadesDispersa.end(), origen);",
+        "    auto it2 = std::find(ciudadesDispersa.begin(),",
+        "                         ciudadesDispersa.end(), destino);",
+        "    int i = (int)(it1 - ciudadesDispersa.begin());",
+        "    int j = (int)(it2 - ciudadesDispersa.begin());",
+        "    // Solo guarda el par (i,j): ahorra memoria vs. matriz densa",
+        "    matrizDispersa[{i, j}] = prioridad;",
+        "}",
+    });
+
+    // 7. Resultados
+    d.gap(4);
+    d.sectionBanner("7.  Resultados y Evidencias de Funcionamiento",NAVY);
+    d.para("A continuacion se muestran capturas del programa en ejecucion, "
+           "demostrando cada modulo funcional del sistema de mensajeria.");
+    d.gap(4);
+
+    d.subHead("Menu Principal del Sistema",NAVY);
+    d.term({
+        "  +--------------------------------------+",
+        "  |   SISTEMA DE MENSAJERIA v1.0         |",
+        "  +--------------------------------------+",
+        "  | 1. Gestion de Rutas (Lista enlazada) |",
+        "  | 2. Gestion de Paquetes (Cola/Pila)   |",
+        "  | 3. Simulacion Cola Circular (Camion) |",
+        "  | 4. Manejo de Matrices                |",
+        "  | 5. Resumen General                   |",
+        "  | 0. Salir                             |",
+        "  +--------------------------------------+",
+        "  Opcion: _",
+    },"Menu Principal");
+
+    d.subHead("Gestion de Rutas — Lista Enlazada",NAVY);
+    d.term({
+        "  Ciudad \"Ciudad Victoria\" agregada.",
+        "  Ciudad \"Monterrey\" agregada.",
+        "  Ciudad \"Tampico\" agregada.",
+        "  Ciudad \"Matamoros\" agregada.",
+        "",
+        "  === RUTA ACTUAL ===",
+        "  [0] Ciudad Victoria --> [1] Monterrey --> [2] Tampico --> [3] Matamoros",
+        "  Total de ciudades: 4",
+    },"Lista Enlazada");
+
+    d.subHead("Cola FIFO (Pendientes) y Pila LIFO (Urgentes)",NAVY);
+    d.term({
+        "  Paquete pendiente agregado (ID 1).",
+        "  Paquete pendiente agregado (ID 2).",
+        "  Procesando paquete pendiente:",
+        "    ID: 1 | Desc: Libros       | Destino: Monterrey | Normal",
+        "  Paquete asignado a la ruta.",
+        "",
+        "  Paquete urgente agregado (ID 3).",
+        "  Procesando paquete urgente (LIFO):",
+        "    ID: 3 | Desc: Medicamentos | Destino: Tampico   | URGENTE",
+        "  Paquete urgente despachado.",
+    },"Cola FIFO + Pila LIFO");
+
+    d.subHead("Simulacion Cola Circular — Desplazamiento del Camion",NAVY);
+    d.term({
+        "  Punto \"Bodega Central\"   cargado  [0]",
+        "  Punto \"Zona Norte\"       cargado  [1]",
+        "  Punto \"Zona Sur\"         cargado  [2]",
+        "  Punto \"Centro Dist.\"     cargado  [3]",
+        "",
+        "  Camion avanzo -> Zona Norte",
+        "  Camion avanzo -> Zona Sur",
+        "  Camion avanzo -> Centro Dist.",
+        "  Camion avanzo -> Bodega Central   <-- modulo: regresa al inicio",
+        "",
+        "  === COLA CIRCULAR: PUNTOS DE CONTROL ===",
+        "  [0] Bodega Central   <-- CAMION AQUI",
+        "  [1] Zona Norte",
+        "  [2] Zona Sur",
+        "  [3] Centro Distribucion",
+    },"Cola Circular");
+
+    d.subHead("Matrices — 1D, 2D y Dispersa",NAVY);
+    d.term({
+        "  === MATRIZ 1D: DISTANCIAS ===",
+        "  [0] Ciudad Victoria  ->   0.0 km",
+        "  [1] Monterrey        -> 234.5 km",
+        "  [2] Tampico          -> 180.0 km",
+        "",
+        "  === MATRIZ 2D: TIEMPOS ESTIMADOS (horas) ===",
+        "                Vic.   Mty.   Tamp.",
+        "  Vic.           0.0    2.5    2.0",
+        "  Mty.           2.5    0.0    3.1",
+        "  Tamp.          2.0    3.1    0.0",
+        "",
+        "  === MATRIZ DISPERSA: RUTAS PRIORITARIAS ===",
+        "  Elementos no cero: 2 de 9 posibles (densidad: 22%)",
+        "  [Ciudad Victoria] -> [Monterrey]   Prioridad: 9.5",
+        "  [Tampico]         -> [Matamoros]   Prioridad: 7.0",
+    },"Matrices");
+
+    // 8. Conclusiones
+    d.gap(4);
+    d.sectionBanner("8.  Conclusiones");
+    d.gap(4);
+    struct C{std::string t,desc;};
+    std::vector<C> cs={
+        {"Modularidad y Mantenibilidad",
+         "La separacion en archivos .h y .cpp junto con CMake facilita el mantenimiento y "
+         "la escalabilidad del proyecto. Cada clase tiene una responsabilidad unica, "
+         "siguiendo el principio SRP de la programacion orientada a objetos."},
+        {"Eleccion Correcta de Estructuras",
+         "Lista enlazada para insercion dinamica, cola para orden de llegada, pila para LIFO, "
+         "cola circular para simulacion ciclica y mapa para datos escasos: cada estructura "
+         "fue elegida por sus propiedades algoritmicas especificas, no arbitrariamente."},
+        {"Eficiencia en Memoria",
+         "El uso de std::map para la matriz dispersa evita desperdiciar O(N^2) espacio cuando "
+         "la mayoria de pares de ciudades no tienen relacion prioritaria. "
+         "Esto es fundamental en sistemas de escala real con decenas de ciudades."},
+        {"Extensibilidad del Sistema",
+         "El diseno permite agregar nuevas funcionalidades sin romper el codigo existente. "
+         "Nuevos tipos de paquetes, algoritmos de ruteo o conexion a bases de datos pueden "
+         "incorporarse creando nuevas clases que compongan las existentes."},
+        {"Aprendizaje Integral",
+         "El proyecto integro de forma practica los conceptos de POO, estructuras de datos "
+         "lineales y matrices, demostrando que la teoria de algoritmos tiene aplicaciones "
+         "directas en sistemas reales como la logistica y la mensajeria."},
+    };
+    for(auto& c:cs){
+        d.subHead(c.t,BLUE);
+        d.para(c.desc,nullptr,9.5,DGRAY,12.0);
+        d.gap(3);
+    }
+
+    d.hr2();
+    d.fnt(cfSans,8.0); d.col(DGRAY);
+    std::string foot="Sistema de Gestion de Rutas y Paquetes  |  C++17 / CMake / Cairo PDF  |  2026";
+    double fw=d.tw(foot);
+    d.txt((PW-fw)/2, d.y+10, foot);
+}
+
+// ============================================================
+int main() {
+    const char* out = "ReporteTecnico_CPP.pdf";
+    initFonts();
+    {
+        Doc doc(out);
+        buildCover(doc);
+        doc.newPage();
+        buildContent(doc);
+        printf("PDF generado: %s  (%d paginas)\n", out, doc.pageNo);
+    }
+    doneFonts();
+    return 0;
+}
